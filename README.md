@@ -1,1 +1,1 @@
-### fafoing over harness engineering  zig and golang 
+### fafoing over harness engineering in zig and golang 

@@ -63,7 +63,7 @@ pub fn main() !void {
                 try writer.flush();
                 continue;
             };
-            defer result.deinit(allocator);
+            defer allocator.free(result);
             try writeResultResponse(writer, id_val, result);
         } else if (std.mem.eql(u8, method, "write_file")) {
             const result = handleWriteFile(allocator, params) catch |err| {
@@ -71,7 +71,7 @@ pub fn main() !void {
                 try writer.flush();
                 continue;
             };
-            defer result.deinit(allocator);
+            defer allocator.free(result);
             try writeResultResponse(writer, id_val, result);
         } else if (std.mem.eql(u8, method, "edit_file")) {
             const result = handleEditFile(allocator, params) catch |err| {
@@ -79,7 +79,7 @@ pub fn main() !void {
                 try writer.flush();
                 continue;
             };
-            defer result.deinit(allocator);
+            defer allocator.free(result);
             try writeResultResponse(writer, id_val, result);
         } else if (std.mem.eql(u8, method, "list_dir")) {
             const result = handleListDir(allocator, params) catch |err| {
@@ -87,7 +87,7 @@ pub fn main() !void {
                 try writer.flush();
                 continue;
             };
-            defer result.deinit(allocator);
+            defer allocator.free(result);
             try writeResultResponse(writer, id_val, result);
         } else if (std.mem.eql(u8, method, "glob")) {
             const result = handleGlob(allocator, params) catch |err| {
@@ -95,7 +95,7 @@ pub fn main() !void {
                 try writer.flush();
                 continue;
             };
-            defer result.deinit(allocator);
+            defer allocator.free(result);
             try writeResultResponse(writer, id_val, result);
         } else if (std.mem.eql(u8, method, "grep")) {
             const result = handleGrep(allocator, params) catch |err| {
@@ -103,7 +103,7 @@ pub fn main() !void {
                 try writer.flush();
                 continue;
             };
-            defer result.deinit(allocator);
+            defer allocator.free(result);
             try writeResultResponse(writer, id_val, result);
         } else {
             try writeErrorResponse(allocator, writer, id_val, -32601, "Method not found", error.MethodNotFound);
@@ -113,14 +113,17 @@ pub fn main() !void {
     }
 }
 
-const OwnedResult = struct {
-    json: []u8,
-    pub fn deinit(self: OwnedResult, allocator: std.mem.Allocator) void {
-        allocator.free(self.json);
-    }
-};
+// Build a JSON {"output":"..."} blob and return as owned slice.
+fn makeOutput(allocator: std.mem.Allocator, content: []const u8) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.writeAll("{\"output\":");
+    try writeJSONStringIo(&aw.writer, content);
+    try aw.writer.writeAll("}");
+    return aw.toOwnedSlice();
+}
 
-fn handleReadFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedResult {
+fn handleReadFile(allocator: std.mem.Allocator, params_val: ?JsonValue) ![]u8 {
     const p = try requireObject(params_val);
     const path = try requireString(p.get("path"));
     const offset = optionalInt(p.get("offset")) orelse 1;
@@ -131,13 +134,12 @@ fn handleReadFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedRe
     const data = try std.fs.cwd().readFileAlloc(allocator, path, 50 * 1024 * 1024);
     defer allocator.free(data);
 
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+
     var it = std.mem.splitScalar(u8, data, '\n');
     var line_no: i64 = 0;
     var returned: i64 = 0;
-
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
-    var w = out.writer();
 
     while (it.next()) |line_raw| {
         line_no += 1;
@@ -149,15 +151,16 @@ fn handleReadFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedRe
         else
             line_raw;
 
-        try w.print("{d}: {s}\n", .{ line_no, line });
+        try aw.writer.print("{d}: {s}\n", .{ line_no, line });
         returned += 1;
     }
 
-    const text = out.items;
+    const text = try aw.toOwnedSlice();
+    defer allocator.free(text);
     return makeOutput(allocator, text);
 }
 
-fn handleWriteFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedResult {
+fn handleWriteFile(allocator: std.mem.Allocator, params_val: ?JsonValue) ![]u8 {
     const p = try requireObject(params_val);
     const path = try requireString(p.get("path"));
     const content = try requireString(p.get("content"));
@@ -167,13 +170,15 @@ fn handleWriteFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedR
     defer file.close();
     try file.writeAll(content);
 
-    var msg = std.ArrayList(u8).init(allocator);
-    defer msg.deinit();
-    try msg.writer().print("Wrote {d} bytes to {s}", .{ content.len, path });
-    return makeOutput(allocator, msg.items);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    try aw.writer.print("Wrote {d} bytes to {s}", .{ content.len, path });
+    const msg = try aw.toOwnedSlice();
+    defer allocator.free(msg);
+    return makeOutput(allocator, msg);
 }
 
-fn handleEditFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedResult {
+fn handleEditFile(allocator: std.mem.Allocator, params_val: ?JsonValue) ![]u8 {
     const p = try requireObject(params_val);
     const path = try requireString(p.get("path"));
     const old_string = try requireString(p.get("old_string"));
@@ -183,45 +188,50 @@ fn handleEditFile(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedRe
     const src = try std.fs.cwd().readFileAlloc(allocator, path, 50 * 1024 * 1024);
     defer allocator.free(src);
 
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
     if (old_string.len == 0) {
-        try out.appendSlice(new_string);
+        try aw.writer.writeAll(new_string);
     } else if (!replace_all) {
         const idx_opt = std.mem.indexOf(u8, src, old_string);
         if (idx_opt == null) return error.OldStringNotFound;
         const idx = idx_opt.?;
-        try out.appendSlice(src[0..idx]);
-        try out.appendSlice(new_string);
-        try out.appendSlice(src[idx + old_string.len ..]);
+        try aw.writer.writeAll(src[0..idx]);
+        try aw.writer.writeAll(new_string);
+        try aw.writer.writeAll(src[idx + old_string.len ..]);
     } else {
         var pos: usize = 0;
         while (true) {
             const rel = std.mem.indexOf(u8, src[pos..], old_string);
             if (rel == null) {
-                try out.appendSlice(src[pos..]);
+                try aw.writer.writeAll(src[pos..]);
                 break;
             }
             const i = pos + rel.?;
-            try out.appendSlice(src[pos..i]);
-            try out.appendSlice(new_string);
+            try aw.writer.writeAll(src[pos..i]);
+            try aw.writer.writeAll(new_string);
             pos = i + old_string.len;
         }
     }
 
+    const out = try aw.toOwnedSlice();
+    defer allocator.free(out);
+
     try ensureParentDirs(path);
     var file = try std.fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
-    try file.writeAll(out.items);
+    try file.writeAll(out);
 
-    var msg = std.ArrayList(u8).init(allocator);
-    defer msg.deinit();
-    try msg.writer().print("Edited {s} successfully", .{path});
-    return makeOutput(allocator, msg.items);
+    var maw: std.Io.Writer.Allocating = .init(allocator);
+    defer maw.deinit();
+    try maw.writer.print("Edited {s} successfully", .{path});
+    const msg = try maw.toOwnedSlice();
+    defer allocator.free(msg);
+    return makeOutput(allocator, msg);
 }
 
-fn handleListDir(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedResult {
+fn handleListDir(allocator: std.mem.Allocator, params_val: ?JsonValue) ![]u8 {
     const p = try requireObject(params_val);
     const path = try requireString(p.get("path"));
 
@@ -230,124 +240,125 @@ fn handleListDir(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedRes
 
     var it = dir.iterate();
 
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
-    var w = out.writer();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
     while (try it.next()) |entry| {
         const suffix = switch (entry.kind) {
             .directory => "/",
             else => "",
         };
-        try w.print("{s}{s}\n", .{ entry.name, suffix });
+        try aw.writer.print("{s}{s}\n", .{ entry.name, suffix });
     }
 
-    return makeOutput(allocator, out.items);
+    const text = try aw.toOwnedSlice();
+    defer allocator.free(text);
+    return makeOutput(allocator, text);
 }
 
-fn handleGlob(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedResult {
+fn handleGlob(allocator: std.mem.Allocator, params_val: ?JsonValue) ![]u8 {
     const p = try requireObject(params_val);
     const pattern = try requireString(p.get("pattern"));
     const base_path = optionalString(p.get("path")) orelse ".";
 
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try walkAndCollectGlob(allocator, base_path, pattern, &out);
+    try walkAndCollectGlob(base_path, pattern, &aw.writer);
 
-    return makeOutput(allocator, out.items);
+    const text = try aw.toOwnedSlice();
+    defer allocator.free(text);
+    return makeOutput(allocator, text);
 }
 
 fn walkAndCollectGlob(
-    allocator: std.mem.Allocator,
     base_path: []const u8,
     pattern: []const u8,
-    out: *std.ArrayList(u8),
+    out: *std.Io.Writer,
 ) !void {
-    _ = allocator;
-    var stack = std.ArrayList([]u8).init(std.heap.page_allocator);
+    const pa = std.heap.page_allocator;
+    var stack: std.ArrayList([]u8) = .empty;
     defer {
-        for (stack.items) |p| std.heap.page_allocator.free(p);
-        stack.deinit();
+        for (stack.items) |p| pa.free(p);
+        stack.deinit(pa);
     }
 
-    try stack.append(try std.heap.page_allocator.dupe(u8, base_path));
+    try stack.append(pa, try pa.dupe(u8, base_path));
 
     while (stack.items.len > 0) {
-        const current = stack.pop();
-        defer std.heap.page_allocator.free(current);
+        const current = stack.pop().?;
+        defer pa.free(current);
 
         var dir = std.fs.cwd().openDir(current, .{ .iterate = true }) catch continue;
         defer dir.close();
 
         var it = dir.iterate();
         while (try it.next()) |entry| {
-            const child = try std.fs.path.join(std.heap.page_allocator, &.{ current, entry.name });
-            defer std.heap.page_allocator.free(child);
+            const child = try std.fs.path.join(pa, &.{ current, entry.name });
+            defer pa.free(child);
 
-            const rel = child;
-            if (globMatch(pattern, rel)) {
-                try out.writer().print("{s}\n", .{rel});
+            if (globMatch(pattern, child)) {
+                try out.print("{s}\n", .{child});
             }
 
             if (entry.kind == .directory) {
-                try stack.append(try std.heap.page_allocator.dupe(u8, child));
+                try stack.append(pa, try pa.dupe(u8, child));
             }
         }
     }
 }
 
-fn handleGrep(allocator: std.mem.Allocator, params_val: ?JsonValue) !OwnedResult {
+fn handleGrep(allocator: std.mem.Allocator, params_val: ?JsonValue) ![]u8 {
     const p = try requireObject(params_val);
     const pattern = try requireString(p.get("pattern"));
     const base_path = optionalString(p.get("path")) orelse ".";
     const include = optionalString(p.get("include"));
     const case_sensitive = optionalBool(p.get("case_sensitive")) orelse false;
 
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try walkAndGrep(allocator, base_path, pattern, include, case_sensitive, &out);
+    try walkAndGrep(base_path, pattern, include, case_sensitive, &aw.writer);
 
-    if (out.items.len == 0) {
-        try out.appendSlice("No matches found\n");
+    if (aw.writer.end == 0) {
+        try aw.writer.writeAll("No matches found\n");
     }
 
-    return makeOutput(allocator, out.items);
+    const text = try aw.toOwnedSlice();
+    defer allocator.free(text);
+    return makeOutput(allocator, text);
 }
 
 fn walkAndGrep(
-    allocator: std.mem.Allocator,
     base_path: []const u8,
     pattern: []const u8,
     include: ?[]const u8,
     case_sensitive: bool,
-    out: *std.ArrayList(u8),
+    out: *std.Io.Writer,
 ) !void {
-    _ = allocator;
-
-    var stack = std.ArrayList([]u8).init(std.heap.page_allocator);
+    const pa = std.heap.page_allocator;
+    var stack: std.ArrayList([]u8) = .empty;
     defer {
-        for (stack.items) |p| std.heap.page_allocator.free(p);
-        stack.deinit();
+        for (stack.items) |p| pa.free(p);
+        stack.deinit(pa);
     }
 
-    try stack.append(try std.heap.page_allocator.dupe(u8, base_path));
+    try stack.append(pa, try pa.dupe(u8, base_path));
 
     while (stack.items.len > 0) {
-        const current = stack.pop();
-        defer std.heap.page_allocator.free(current);
+        const current = stack.pop().?;
+        defer pa.free(current);
 
         var dir = std.fs.cwd().openDir(current, .{ .iterate = true }) catch continue;
         defer dir.close();
 
         var it = dir.iterate();
         while (try it.next()) |entry| {
-            const child = try std.fs.path.join(std.heap.page_allocator, &.{ current, entry.name });
-            defer std.heap.page_allocator.free(child);
+            const child = try std.fs.path.join(pa, &.{ current, entry.name });
+            defer pa.free(child);
 
             if (entry.kind == .directory) {
-                try stack.append(try std.heap.page_allocator.dupe(u8, child));
+                try stack.append(pa, try pa.dupe(u8, child));
                 continue;
             }
 
@@ -355,8 +366,8 @@ fn walkAndGrep(
                 if (!globMatch(inc, child)) continue;
             }
 
-            const data = std.fs.cwd().readFileAlloc(std.heap.page_allocator, child, 10 * 1024 * 1024) catch continue;
-            defer std.heap.page_allocator.free(data);
+            const data = std.fs.cwd().readFileAlloc(pa, child, 10 * 1024 * 1024) catch continue;
+            defer pa.free(data);
 
             var line_it = std.mem.splitScalar(u8, data, '\n');
             var line_no: usize = 0;
@@ -368,7 +379,7 @@ fn walkAndGrep(
                     line_raw;
 
                 if (containsPattern(line, pattern, case_sensitive)) {
-                    try out.writer().print("{s}:{d}:{s}\n", .{ child, line_no, line });
+                    try out.print("{s}:{d}:{s}\n", .{ child, line_no, line });
                 }
             }
         }
@@ -448,43 +459,28 @@ fn ensureParentDirs(path: []const u8) !void {
     }
 }
 
-fn makeOutput(allocator: std.mem.Allocator, content: []const u8) !OwnedResult {
-    var out = std.ArrayList(u8).init(allocator);
-    defer out.deinit();
-
-    try out.appendSlice("{\"output\":");
-    try writeJSONString(out.writer(), content);
-    try out.appendSlice("}");
-
-    return OwnedResult{
-        .json = try out.toOwnedSlice(),
-    };
-}
-
-fn writeResultResponse(writer: *std.Io.Writer, id_val: ?JsonValue, result: OwnedResult) !void {
+fn writeResultResponse(writer: *std.Io.Writer, id_val: ?JsonValue, result: []const u8) !void {
     try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writeID(writer, id_val);
     try writer.writeAll(",\"result\":");
-    try writer.writeAll(result.json);
+    try writer.writeAll(result);
     try writer.writeAll("}\n");
 }
 
 fn writeErrorResponse(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator,
     writer: *std.Io.Writer,
     id_val: ?JsonValue,
     code: i64,
     message: []const u8,
-    err: anyerror,
+    _: anyerror,
 ) !void {
-    _ = allocator;
-    _ = err;
     try writer.writeAll("{\"jsonrpc\":\"2.0\",\"id\":");
     try writeID(writer, id_val);
     try writer.writeAll(",\"error\":{\"code\":");
     try writer.print("{d}", .{code});
     try writer.writeAll(",\"message\":");
-    try writeJSONString(writer, message);
+    try writeJSONStringIo(writer, message);
     try writer.writeAll("}}\n");
 }
 
@@ -497,41 +493,43 @@ fn writeID(writer: *std.Io.Writer, id_val: ?JsonValue) !void {
     switch (id) {
         .integer => |v| try writer.print("{d}", .{v}),
         .float => |v| try writer.print("{d}", .{v}),
-        .string => |s| try writeJSONString(writer, s),
+        .string => |s| try writeJSONStringIo(writer, s),
         else => try writer.writeAll("null"),
     }
 }
 
-// Read a line from the new std.Io.Reader, returns null on EOF.
+// Read a line from std.Io.Reader; returns null on EOF.
 fn readLineAlloc(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     max_len: usize,
 ) !?[]u8 {
-    var buf = std.ArrayList(u8).init(allocator);
-    errdefer buf.deinit();
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    errdefer aw.deinit();
 
     while (true) {
         const byte = reader.takeByte() catch |err| switch (err) {
             error.EndOfStream => {
-                if (buf.items.len == 0) {
-                    buf.deinit();
+                if (aw.writer.end == 0) {
+                    aw.deinit();
                     return null;
                 }
-                return buf.toOwnedSlice();
+                const s = try aw.toOwnedSlice();
+                return s;
             },
             else => return err,
         };
 
         if (byte == '\n') break;
-        if (buf.items.len >= max_len) return error.LineTooLong;
-        try buf.append(byte);
+        if (aw.writer.end >= max_len) return error.LineTooLong;
+        try aw.writer.writeByte(byte);
     }
 
-    return buf.toOwnedSlice();
+    const s = try aw.toOwnedSlice();
+    return s;
 }
 
-fn writeJSONString(writer: anytype, s: []const u8) !void {
+fn writeJSONStringIo(writer: *std.Io.Writer, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| {
         switch (c) {
