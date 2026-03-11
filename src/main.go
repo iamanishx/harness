@@ -58,7 +58,7 @@ func main() {
 
 	ctx := context.Background()
 	s, err := ag.Stream(ctx, agentpkg.AgentCallOptions{
-		Prompt: "Use tools to inspect the current project directory, then read go.mod.",
+		Prompt: "change the 20-24 races to 50-60 race in @f1.txt",
 	})
 	if err != nil {
 		log.Fatalf("agent failed: %v", err)

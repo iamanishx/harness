@@ -3,8 +3,9 @@ module goai-test
 go 1.25.7
 
 require (
-	github.com/iamanishx/go-ai/agent v0.1.0
-	github.com/iamanishx/go-ai/provider/bedrock v0.1.0
+	github.com/iamanishx/go-ai/agent v0.1.1-0.20260311034853-633bbb3827ad
+	github.com/iamanishx/go-ai/provider v0.1.1-0.20260311034853-633bbb3827ad
+	github.com/iamanishx/go-ai/provider/bedrock v0.1.1-0.20260311034853-633bbb3827ad
 )
 
 require (
@@ -24,6 +25,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.27.0 // indirect
 	github.com/aws/smithy-go v1.22.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/iamanishx/go-ai/provider v0.1.0 // indirect
 	github.com/iamanishx/go-ai/stream v0.1.0 // indirect
 )

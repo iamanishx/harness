@@ -498,7 +498,6 @@ fn writeID(writer: *std.Io.Writer, id_val: ?JsonValue) !void {
     }
 }
 
-// Read a line from std.Io.Reader; returns null on EOF.
 fn readLineAlloc(
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
