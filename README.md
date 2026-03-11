@@ -15,3 +15,15 @@ zig stdout → go client → tool result → back to claude
 ```
 
 built with zig 0.15 (yes we survived writergate) and go 1.25.
+
+#### memory usage — zig vs node/ts
+
+measured with `/usr/bin/time -v` (peak RSS):
+
+| file size | zig binary | node/ts (typical) |
+|-----------|------------|-------------------|
+| 1 KB      | ~2 MB      | ~50 MB            |
+| 10 MB     | ~22 MB     | ~100-150 MB       |
+| 50 MB     | ~102 MB    | ~300-500 MB       |
+
+zig's memory is almost entirely the file data itself. node has the v8 heap baseline (~30-50MB) before it even opens the file, plus 3-4x copies from immutable string operations and GC overhead.
