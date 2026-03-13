@@ -1,8 +1,7 @@
 package main
 
 import (
-	"context"
-	"fmt"
+	"flag"
 	"log"
 	"os"
 	"os/exec"
@@ -10,161 +9,153 @@ import (
 	"runtime"
 	"strings"
 
-	agentpkg "github.com/iamanishx/go-ai/agent"
-	"github.com/iamanishx/go-ai/provider/bedrock"
+	acp "github.com/coder/acp-go-sdk"
 
-	"goai-test/tools/filesystem"
+	acpserver "goai-test/acp"
+	goairuntime "goai-test/runtime"
+	"goai-test/storage"
 )
 
 func main() {
-	zigProjectDir := filepath.FromSlash("./tools/filesystem/zig-bindings")
-	zigBinaryPath := filepath.FromSlash("./tools/filesystem/zig-bindings/zig-out/bin/filesystem_mcp")
-	if runtime.GOOS == "windows" {
-		zigBinaryPath += ".exe"
+	dbPath := flag.String("db-path", defaultDBPath(), "path to SQLite database")
+	region := flag.String("region", "us-east-1", "AWS region for Bedrock")
+	profile := flag.String("profile", "clickpe", "AWS profile for Bedrock")
+	modelID := flag.String("model", "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "Bedrock model ID")
+	flag.Parse()
+
+	logDir := filepath.Join(filepath.Dir(defaultDBPath()), "logs")
+	_ = os.MkdirAll(logDir, 0o755)
+	logFile, err := os.OpenFile(filepath.Join(logDir, "goai.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
 	}
 
-	zigExec, err := resolveZigExecutable()
+	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
+		log.Fatalf("create db dir: %v", err)
+	}
+
+	db, err := storage.Open(*dbPath)
 	if err != nil {
-		log.Fatalf("failed to resolve Zig executable: %v", err)
+		log.Fatalf("open db: %v", err)
 	}
+	defer db.Close()
 
-	if err := ensureZigBinary(zigExec, zigProjectDir, zigBinaryPath); err != nil {
-		log.Fatalf("failed to prepare filesystem MCP binary: %v", err)
-	}
-
-	fsClient, err := filesystem.NewClient(zigBinaryPath)
+	zigBinaryPath, err := resolveZigBinary()
 	if err != nil {
-		log.Fatalf("failed to start filesystem MCP client: %v", err)
+		log.Fatalf("prepare zig binary: %v", err)
 	}
-	defer func() {
-		if cerr := fsClient.Close(); cerr != nil {
-			log.Printf("filesystem MCP client close error: %v", cerr)
-		}
-	}()
 
-	toolFactory := filesystem.NewToolFactory(fsClient)
+	bus := goairuntime.NewEventBus()
+	sessions := goairuntime.NewSessionManager(db, bus)
+	messages := goairuntime.NewMessageStore(db, bus)
 
-	provider := bedrock.Create(bedrock.BedrockProviderSettings{
-		Region:  "us-east-1",
-		Profile: "clickpe",
+	agentLoop := goairuntime.NewAgentLoop(goairuntime.AgentLoopConfig{
+		Region:        *region,
+		Profile:       *profile,
+		ModelID:       *modelID,
+		ZigBinaryPath: zigBinaryPath,
+		Store:         messages,
+		Bus:           bus,
 	})
 
-	ag := agentpkg.CreateToolLoopAgent(agentpkg.ToolLoopAgentSettings{
-		Model:        provider.Chat("us.anthropic.claude-sonnet-4-5-20250929-v1:0"),
-		Tools:        toolFactory.Tools(),
-		ExecuteTools: true,
-		MaxSteps:     20,
-	})
+	srv := acpserver.NewServer(sessions, messages, agentLoop, db)
+	stdinProxy := acpserver.NewInterceptReader(os.Stdin, os.Stdout, db)
+	stdoutProxy := acpserver.NewInterceptWriter(os.Stdout, stdinProxy.InitID)
+	conn := acp.NewAgentSideConnection(srv, stdoutProxy, stdinProxy)
+	srv.SetConnection(conn)
 
-	ctx := context.Background()
-	s, err := ag.Stream(ctx, agentpkg.AgentCallOptions{
-		Prompt: "change the 20-24 races to 50-60 race in @f1.txt",
-	})
-	if err != nil {
-		log.Fatalf("agent failed: %v", err)
-	}
-	defer s.Close()
-
-	for part := range s.Part() {
-		switch part.Type {
-		case "text-delta":
-			fmt.Print(part.Text)
-		case "tool-call":
-			fmt.Printf("\n[tool-call: %s]\n", part.ToolName)
-		case "tool-input-delta":
-			fmt.Print(part.ToolInputDelta)
-		case "tool-result":
-			fmt.Printf("\n[tool-result: %s]\n", part.ToolName)
-		case "finish":
-			fmt.Printf("\n[finish: %s]\n", part.FinishReason)
-		case "error":
-			fmt.Printf("\n[error: %v]\n", part.Error)
-		}
-	}
+	<-conn.Done()
 }
 
-func ensureZigBinary(zigExec, zigProjectDir, zigBinaryPath string) error {
-	if fileExists(zigBinaryPath) {
-		return nil
+func defaultDBPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".goai/harness.db"
 	}
-
-	log.Printf("zig MCP binary not found at %s; attempting to build with `%s build`...", zigBinaryPath, zigExec)
-
-	cmd := exec.Command(zigExec, "build")
-	cmd.Dir = zigProjectDir
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("zig build failed in %s: %w", zigProjectDir, err)
-	}
-
-	if !fileExists(zigBinaryPath) {
-		return fmt.Errorf("zig build completed but binary still not found at %s", zigBinaryPath)
-	}
-
-	log.Printf("zig MCP binary built successfully: %s", zigBinaryPath)
-	return nil
+	return filepath.Join(home, ".goai", "harness.db")
 }
 
-func resolveZigExecutable() (string, error) {
-	// 1) Explicit env override.
-	if p := strings.TrimSpace(os.Getenv("ZIG_BIN")); p != "" {
-		if isExecutableFile(p) {
-			return p, nil
-		}
-		return "", fmt.Errorf("ZIG_BIN is set but not executable: %s", p)
+func resolveZigBinary() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		self = "."
 	}
+	selfDir := filepath.Dir(self)
 
-	// 2) PATH lookup.
-	if p, err := exec.LookPath("zig"); err == nil {
-		return p, nil
-	}
-
-	// 3) Common absolute install locations.
 	candidates := []string{
-		"/usr/local/bin/zig",
-		"/usr/bin/zig",
-		"/opt/homebrew/bin/zig",
-		"/snap/bin/zig",
-		filepath.FromSlash("/mnt/c/Program Files/zig/zig.exe"),
-		filepath.FromSlash("/mnt/c/zig/zig.exe"),
+		filepath.Join(selfDir, "tools/filesystem/zig-bindings/zig-out/bin/filesystem_mcp"),
+		filepath.FromSlash("./tools/filesystem/zig-bindings/zig-out/bin/filesystem_mcp"),
 	}
+	if runtime.GOOS == "windows" {
+		for i, c := range candidates {
+			candidates[i] = c + ".exe"
+		}
+	}
+
 	for _, c := range candidates {
-		if isExecutableFile(c) {
+		if fileExists(c) {
+			abs, err := filepath.Abs(c)
+			if err == nil {
+				return abs, nil
+			}
 			return c, nil
 		}
 	}
 
-	// 4) Shell login lookup fallback (helps when PATH differs for non-interactive exec).
-	if p := resolveViaShell(); p != "" && isExecutableFile(p) {
-		return p, nil
+	zigExec, err := resolveZigExecutable()
+	if err != nil {
+		return "", err
 	}
 
-	return "", fmt.Errorf("zig executable not found; set ZIG_BIN or add zig to PATH")
+	zigProjectDir := filepath.FromSlash("./tools/filesystem/zig-bindings")
+	zigBinaryPath := candidates[1]
+
+	log.Printf("zig binary not found; building...")
+	cmd := exec.Command(zigExec, "build")
+	cmd.Dir = zigProjectDir
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+	if !fileExists(zigBinaryPath) {
+		return "", os.ErrNotExist
+	}
+	abs, err := filepath.Abs(zigBinaryPath)
+	if err != nil {
+		return zigBinaryPath, nil
+	}
+	return abs, nil
 }
 
-func resolveViaShell() string {
-	shellCandidates := []struct {
-		prog string
-		args []string
-	}{
-		{"bash", []string{"-lc", "command -v zig"}},
-		{"zsh", []string{"-lc", "command -v zig"}},
-		{"sh", []string{"-lc", "command -v zig"}},
-	}
-
-	for _, sh := range shellCandidates {
-		out, err := exec.Command(sh.prog, sh.args...).Output()
-		if err != nil {
-			continue
-		}
-		p := strings.TrimSpace(string(out))
-		if p != "" {
-			return p
+func resolveZigExecutable() (string, error) {
+	if p := strings.TrimSpace(os.Getenv("ZIG_BIN")); p != "" {
+		if isExecutableFile(p) {
+			return p, nil
 		}
 	}
-	return ""
+	if p, err := exec.LookPath("zig"); err == nil {
+		return p, nil
+	}
+	for _, c := range []string{
+		"/usr/local/bin/zig", "/usr/bin/zig",
+		"/opt/homebrew/bin/zig", "/snap/bin/zig",
+		filepath.FromSlash("/mnt/c/Program Files/zig/zig.exe"),
+		filepath.FromSlash("/mnt/c/zig/zig.exe"),
+	} {
+		if isExecutableFile(c) {
+			return c, nil
+		}
+	}
+	for _, sh := range [][]string{{"bash", "-lc"}, {"zsh", "-lc"}, {"sh", "-lc"}} {
+		out, err := exec.Command(sh[0], sh[1], "command -v zig").Output()
+		if err == nil {
+			if p := strings.TrimSpace(string(out)); isExecutableFile(p) {
+				return p, nil
+			}
+		}
+	}
+	return "", os.ErrNotExist
 }
 
 func isExecutableFile(path string) bool {

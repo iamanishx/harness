@@ -11,3 +11,4 @@
 *.pprof
 /build/
 /bin/
+goai-test

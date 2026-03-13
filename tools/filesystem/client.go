@@ -57,9 +57,15 @@ type ToolResult struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// NewClient starts the Zig server process and prepares streaming JSON-RPC I/O.
 func NewClient(zigBinaryPath string, args ...string) (*Client, error) {
+	return NewClientInDir(zigBinaryPath, "", args...)
+}
+
+func NewClientInDir(zigBinaryPath, dir string, args ...string) (*Client, error) {
 	cmd := exec.Command(zigBinaryPath, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
