@@ -1,4 +1,4 @@
-package runtime
+package agent
 
 import (
 	"context"
@@ -13,34 +13,35 @@ import (
 	agentpkg "github.com/iamanishx/go-ai/agent"
 	"github.com/iamanishx/go-ai/provider"
 	"github.com/iamanishx/go-ai/provider/bedrock"
+	"goai-test/runtime"
 	"goai-test/tools/filesystem"
 	"goai-test/types"
 )
 
-type AgentLoop struct {
+type Loop struct {
 	provider      provider.ChatModel
 	zigBinaryPath string
-	store         *MessageStore
-	bus           *EventBus
+	store         *runtime.MessageStore
+	bus           *runtime.EventBus
 }
 
-func (al *AgentLoop) Bus() *EventBus { return al.bus }
+func (l *Loop) Bus() *runtime.EventBus { return l.bus }
 
-type AgentLoopConfig struct {
+type Config struct {
 	Region        string
 	Profile       string
 	ModelID       string
 	ZigBinaryPath string
-	Store         *MessageStore
-	Bus           *EventBus
+	Store         *runtime.MessageStore
+	Bus           *runtime.EventBus
 }
 
-func NewAgentLoop(cfg AgentLoopConfig) *AgentLoop {
+func New(cfg Config) *Loop {
 	p := bedrock.Create(bedrock.BedrockProviderSettings{
 		Region:  cfg.Region,
 		Profile: cfg.Profile,
 	})
-	return &AgentLoop{
+	return &Loop{
 		provider:      p.Chat(cfg.ModelID),
 		zigBinaryPath: cfg.ZigBinaryPath,
 		store:         cfg.Store,
@@ -48,39 +49,38 @@ func NewAgentLoop(cfg AgentLoopConfig) *AgentLoop {
 	}
 }
 
-func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) error {
-	fsClient, err := filesystem.NewClientInDir(al.zigBinaryPath, cwd)
+func (l *Loop) Run(ctx context.Context, sessionID, cwd, prompt string) error {
+	fsClient, err := filesystem.NewClientInDir(l.zigBinaryPath, cwd)
 	if err != nil {
 		return fmt.Errorf("start filesystem client for %s: %w", cwd, err)
 	}
 	defer fsClient.Close()
 
-	history, err := al.buildHistory(sessionID)
+	history, err := l.buildHistory(sessionID)
 	if err != nil {
 		return fmt.Errorf("build history: %w", err)
 	}
 
 	log.Printf("[agent] session=%s history_len=%d", sessionID, len(history))
 
-	_, err = al.store.CreateUserMessage(sessionID, prompt)
+	_, err = l.store.CreateUserMessage(sessionID, prompt)
 	if err != nil {
 		return fmt.Errorf("create user message: %w", err)
 	}
 
-	assistantMsg, err := al.store.CreateAssistantMessage(sessionID)
+	assistantMsg, err := l.store.CreateAssistantMessage(sessionID)
 	if err != nil {
 		return fmt.Errorf("create assistant message: %w", err)
 	}
 
-	// pendingCallIDs maps toolName -> LLM callID, set by OnToolCallStart just before Execute.
 	var pendingMu sync.Mutex
 	pendingCallIDs := make(map[string]string)
 
 	toolFactory := filesystem.NewToolFactory(fsClient)
-	tools := al.instrumentedTools(toolFactory.Tools(), sessionID, assistantMsg.ID, cwd, &pendingMu, pendingCallIDs)
+	tools := l.instrumentedTools(toolFactory.Tools(), sessionID, assistantMsg.ID, cwd, &pendingMu, pendingCallIDs)
 
 	ag := agentpkg.CreateToolLoopAgent(agentpkg.ToolLoopAgentSettings{
-		Model:        al.provider,
+		Model:        l.provider,
 		Tools:        tools,
 		ExecuteTools: true,
 		MaxSteps:     20,
@@ -95,6 +95,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 	s, err := ag.Stream(ctx, agentpkg.AgentCallOptions{
 		Prompt:   prompt,
 		Messages: history,
+		System:   systemPrompt(cwd),
 	})
 	if err != nil {
 		return fmt.Errorf("agent stream: %w", err)
@@ -107,15 +108,15 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 		switch part.Type {
 		case "text-delta":
 			textBuf.WriteString(part.Text)
-			al.bus.Publish(Event{
-				Type:      EventPartDelta,
+			l.bus.Publish(runtime.Event{
+				Type:      runtime.EventPartDelta,
 				SessionID: sessionID,
 				Data:      map[string]string{"text": part.Text, "message_id": assistantMsg.ID},
 			})
 
 		case "text-end":
 			if textBuf.Len() > 0 {
-				_, _ = al.store.AddTextPart(assistantMsg.ID, sessionID, textBuf.String())
+				_, _ = l.store.AddTextPart(assistantMsg.ID, sessionID, textBuf.String())
 				textBuf.Reset()
 			}
 
@@ -125,14 +126,14 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 	}
 
 	if textBuf.Len() > 0 {
-		_, _ = al.store.AddTextPart(assistantMsg.ID, sessionID, textBuf.String())
+		_, _ = l.store.AddTextPart(assistantMsg.ID, sessionID, textBuf.String())
 	}
 
 	return nil
 }
 
-func (al *AgentLoop) buildHistory(sessionID string) ([]provider.Message, error) {
-	msgs, err := al.store.GetMessages(sessionID)
+func (l *Loop) buildHistory(sessionID string) ([]provider.Message, error) {
+	msgs, err := l.store.GetMessages(sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -149,12 +150,12 @@ func (al *AgentLoop) buildHistory(sessionID string) ([]provider.Message, error) 
 			switch p.Type {
 			case types.PartTypeText:
 				var td types.TextData
-				if _, err := UnmarshalPartData(p.Data, &td); err == nil && td.Text != "" {
+				if _, err := runtime.UnmarshalPartData(p.Data, &td); err == nil && td.Text != "" {
 					textParts = append(textParts, td.Text)
 				}
 			case types.PartTypeTool:
 				var tp types.ToolPart
-				if _, err := UnmarshalPartData(p.Data, &tp); err == nil {
+				if _, err := runtime.UnmarshalPartData(p.Data, &tp); err == nil {
 					toolCalls = append(toolCalls, provider.ToolCall{
 						ID:     tp.CallID,
 						Name:   tp.Tool,
@@ -209,7 +210,7 @@ func (al *AgentLoop) buildHistory(sessionID string) ([]provider.Message, error) 
 	return history, nil
 }
 
-func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, messageID, cwd string, pendingMu *sync.Mutex, pendingCallIDs map[string]string) []provider.Tool {
+func (l *Loop) instrumentedTools(tools []provider.Tool, sessionID, messageID, cwd string, pendingMu *sync.Mutex, pendingCallIDs map[string]string) []provider.Tool {
 	out := make([]provider.Tool, len(tools))
 	for i, t := range tools {
 		t := t
@@ -241,10 +242,10 @@ func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, message
 				TimeStart: time.Now().UnixMilli(),
 				FilePath:  filePath,
 			}
-			p, _ := al.store.AddToolPart(messageID, sessionID, toolPart)
+			p, _ := l.store.AddToolPart(messageID, sessionID, toolPart)
 
 			toolPart.State = types.ToolStateRunning
-			_ = al.store.UpdateToolPart(p.ID, sessionID, toolPart)
+			_ = l.store.UpdateToolPart(p.ID, sessionID, toolPart)
 
 			result, err := originalExecute(input)
 
@@ -266,11 +267,11 @@ func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, message
 					}
 				}
 			}
-			_ = al.store.UpdateToolPart(p.ID, sessionID, toolPart)
+			_ = l.store.UpdateToolPart(p.ID, sessionID, toolPart)
 
 			if err == nil && isWriteOp(t.Name) && filePath != "" {
-				al.bus.Publish(Event{
-					Type:      EventFileChanged,
+				l.bus.Publish(runtime.Event{
+					Type:      runtime.EventFileChanged,
 					SessionID: sessionID,
 					Data:      map[string]string{"path": filePath, "op": t.Name, "cwd": cwd},
 				})
@@ -283,12 +284,13 @@ func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, message
 	return out
 }
 
+func isWriteOp(toolName string) bool {
+	return toolName == "write_file" || toolName == "edit_file"
+}
+
 func resolveToolPath(toolName string, input map[string]any, cwd string) string {
-	key := "path"
-	if toolName == "write_file" || toolName == "edit_file" {
-		key = "path"
-	}
-	raw, ok := input[key]
+	_ = toolName
+	raw, ok := input["path"]
 	if !ok {
 		return ""
 	}

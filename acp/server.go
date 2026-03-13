@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	acp "github.com/coder/acp-go-sdk"
+	"goai-test/agent"
 	"goai-test/runtime"
 	"goai-test/storage"
 	"goai-test/types"
@@ -19,7 +20,7 @@ type Server struct {
 	conn         *acp.AgentSideConnection
 	sessions     *runtime.SessionManager
 	messages     *runtime.MessageStore
-	agent        *runtime.AgentLoop
+	agent        *agent.Loop
 	db           *storage.DB
 	canWriteFile bool
 }
@@ -27,13 +28,13 @@ type Server struct {
 func NewServer(
 	sessions *runtime.SessionManager,
 	messages *runtime.MessageStore,
-	agent *runtime.AgentLoop,
+	ag *agent.Loop,
 	db *storage.DB,
 ) *Server {
 	return &Server{
 		sessions: sessions,
 		messages: messages,
-		agent:    agent,
+		agent:    ag,
 		db:       db,
 	}
 }

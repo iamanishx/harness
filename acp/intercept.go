@@ -42,6 +42,7 @@ type InterceptReader struct {
 	mu     sync.Mutex
 	buf    []byte
 	initID string
+	cwd    string
 }
 
 func NewInterceptReader(r io.Reader, w io.Writer, db *storage.DB) *InterceptReader {
@@ -91,6 +92,16 @@ func (ir *InterceptReader) Read(p []byte) (int, error) {
 			continue
 		}
 
+		if msg.Method == "session/new" || msg.Method == "newSession" {
+			var params struct {
+				Cwd string `json:"cwd"`
+			}
+			if len(msg.Params) > 0 && json.Unmarshal(msg.Params, &params) == nil && params.Cwd != "" {
+				ir.cwd = params.Cwd
+				log.Printf("[intercept] captured cwd=%s", ir.cwd)
+			}
+		}
+
 		if msg.Method == "initialize" && msg.ID != nil {
 			ir.initID = string(*msg.ID)
 		}
@@ -111,6 +122,9 @@ func (ir *InterceptReader) handleListSessions(msg jsonRPCMessage) {
 
 	summaries := make([]sessionSummary, 0, len(sessions))
 	for _, s := range sessions {
+		if ir.cwd != "" && s.CWD != ir.cwd {
+			continue
+		}
 		title := s.Title
 		updatedAt := time.UnixMilli(s.TimeUpdated).UTC().Format(time.RFC3339)
 		summaries = append(summaries, sessionSummary{
@@ -135,7 +149,7 @@ func (ir *InterceptReader) handleListSessions(msg jsonRPCMessage) {
 
 	data = append(data, '\n')
 	_, _ = ir.writer.Write(data)
-	log.Printf("[intercept] sent %d sessions", len(summaries))
+	log.Printf("[intercept] sent %d sessions (cwd=%q)", len(summaries), ir.cwd)
 }
 
 func (ir *InterceptReader) InitID() string {

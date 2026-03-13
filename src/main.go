@@ -12,6 +12,7 @@ import (
 	acp "github.com/coder/acp-go-sdk"
 
 	acpserver "goai-test/acp"
+	"goai-test/agent"
 	goairuntime "goai-test/runtime"
 	"goai-test/storage"
 )
@@ -50,7 +51,7 @@ func main() {
 	sessions := goairuntime.NewSessionManager(db, bus)
 	messages := goairuntime.NewMessageStore(db, bus)
 
-	agentLoop := goairuntime.NewAgentLoop(goairuntime.AgentLoopConfig{
+	agentLoop := agent.New(agent.Config{
 		Region:        *region,
 		Profile:       *profile,
 		ModelID:       *modelID,
