@@ -1,4 +1,4 @@
-# goai-test
+# harness
 
 A minimal coding agent that speaks the [Agent Client Protocol (ACP)](https://agentclientprotocol.com/) over stdio. It connects to editors like Zed as a custom agent server, talks to AWS Bedrock for LLM inference, and uses a native Zig binary for fast filesystem operations.
 
