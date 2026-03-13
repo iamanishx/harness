@@ -4,6 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 
 	acp "github.com/coder/acp-go-sdk"
@@ -13,11 +16,12 @@ import (
 )
 
 type Server struct {
-	conn     *acp.AgentSideConnection
-	sessions *runtime.SessionManager
-	messages *runtime.MessageStore
-	agent    *runtime.AgentLoop
-	db       *storage.DB
+	conn         *acp.AgentSideConnection
+	sessions     *runtime.SessionManager
+	messages     *runtime.MessageStore
+	agent        *runtime.AgentLoop
+	db           *storage.DB
+	canWriteFile bool
 }
 
 func NewServer(
@@ -46,12 +50,16 @@ func (s *Server) Authenticate(_ context.Context, _ acp.AuthenticateRequest) (acp
 	return acp.AuthenticateResponse{}, nil
 }
 
-func (s *Server) Initialize(_ context.Context, _ acp.InitializeRequest) (acp.InitializeResponse, error) {
-	log.Printf("[acp] Initialize called")
+func (s *Server) Initialize(_ context.Context, req acp.InitializeRequest) (acp.InitializeResponse, error) {
+	s.canWriteFile = req.ClientCapabilities.Fs.WriteTextFile
+	log.Printf("[acp] initialize canWriteFile=%v", s.canWriteFile)
 	return acp.InitializeResponse{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 		AgentCapabilities: acp.AgentCapabilities{
 			LoadSession: true,
+			PromptCapabilities: acp.PromptCapabilities{
+				EmbeddedContext: true,
+			},
 		},
 	}, nil
 }
@@ -70,12 +78,11 @@ func (s *Server) NewSession(_ context.Context, p acp.NewSessionRequest) (acp.New
 	if cwd == "" {
 		cwd = "."
 	}
-	log.Printf("[acp] NewSession called cwd=%s", cwd)
 	sess, err := s.sessions.Create(cwd)
 	if err != nil {
 		return acp.NewSessionResponse{}, fmt.Errorf("create session: %w", err)
 	}
-	log.Printf("[acp] NewSession created session=%s", sess.ID)
+	log.Printf("[acp] new session=%s cwd=%s", sess.ID, cwd)
 	return acp.NewSessionResponse{
 		SessionId: acp.SessionId(sess.ID),
 	}, nil
@@ -83,7 +90,6 @@ func (s *Server) NewSession(_ context.Context, p acp.NewSessionRequest) (acp.New
 
 func (s *Server) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptResponse, error) {
 	sessionID := string(p.SessionId)
-	log.Printf("[acp] Prompt called session=%s", sessionID)
 
 	sess, ok := s.sessions.Get(sessionID)
 	if !ok {
@@ -95,7 +101,7 @@ func (s *Server) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptRes
 	}
 
 	text := promptText(p.Prompt)
-	log.Printf("[acp] Prompt text=%q", text)
+	log.Printf("[acp] prompt session=%s text=%q", sessionID, truncate(text, 80))
 
 	if sess.Title == "" {
 		title := text
@@ -127,6 +133,7 @@ func (s *Server) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptRes
 						Update: acp.StartToolCall(
 							acp.ToolCallId(tp.CallID),
 							tp.Tool,
+							acp.WithStartKind(toolKind(tp.Tool)),
 							acp.WithStartStatus(acp.ToolCallStatusPending),
 						),
 					})
@@ -136,13 +143,34 @@ func (s *Server) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptRes
 		case runtime.EventPartUpdated:
 			if d, ok := e.Data.(map[string]any); ok {
 				if tp, ok2 := d["tool"].(types.ToolPart); ok2 {
+					opts := []acp.ToolCallUpdateOpt{
+						acp.WithUpdateStatus(toolCallStatus(tp.State)),
+						acp.WithUpdateRawOutput(tp.Output),
+					}
+					if tp.State == types.ToolStateCompleted && tp.FilePath != "" && tp.NewContent != "" {
+						log.Printf("[diff] sending diff to Zed session=%s tool=%s path=%s old_bytes=%d new_bytes=%d",
+							sessionID, tp.Tool, tp.FilePath, len(tp.OldContent), len(tp.NewContent))
+						opts = append(opts, acp.WithUpdateContent([]acp.ToolCallContent{
+							acp.ToolContent(acp.ContentBlock{Text: &acp.ContentBlockText{Text: tp.Output}}),
+							acp.ToolDiffContent(tp.FilePath, tp.NewContent, tp.OldContent),
+						}))
+						if s.canWriteFile {
+							log.Printf("[diff] calling WriteTextFile session=%s path=%s", sessionID, tp.FilePath)
+							_, writeErr := s.conn.WriteTextFile(ctx, acp.WriteTextFileRequest{
+								SessionId: p.SessionId,
+								Path:      tp.FilePath,
+								Content:   tp.NewContent,
+							})
+							if writeErr != nil {
+								log.Printf("[diff] WriteTextFile error: %v", writeErr)
+							}
+						} else {
+							log.Printf("[diff] skipping WriteTextFile (client capability not set)")
+						}
+					}
 					_ = s.conn.SessionUpdate(ctx, acp.SessionNotification{
 						SessionId: p.SessionId,
-						Update: acp.UpdateToolCall(
-							acp.ToolCallId(tp.CallID),
-							acp.WithUpdateStatus(toolCallStatus(tp.State)),
-							acp.WithUpdateRawOutput(tp.Output),
-						),
+						Update:    acp.UpdateToolCall(acp.ToolCallId(tp.CallID), opts...),
 					})
 				}
 			}
@@ -172,21 +200,17 @@ func (s *Server) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptRes
 
 func (s *Server) LoadSession(ctx context.Context, p acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
 	sessionID := string(p.SessionId)
-	log.Printf("[acp] LoadSession called session=%s", sessionID)
 
 	sess, err := s.sessions.Load(sessionID)
 	if err != nil {
-		log.Printf("[acp] LoadSession session not found: %v", err)
+		log.Printf("[acp] load session not found: %s", sessionID)
 		return acp.LoadSessionResponse{}, nil
 	}
-	log.Printf("[acp] LoadSession found session=%s title=%q cwd=%s", sess.ID, sess.Title, sess.CWD)
 
 	entries, err := runtime.Replay(s.db, sessionID)
 	if err != nil {
-		log.Printf("[acp] LoadSession replay error: %v", err)
 		return acp.LoadSessionResponse{}, nil
 	}
-	log.Printf("[acp] LoadSession replay entries=%d", len(entries))
 
 	sid := acp.SessionId(sess.ID)
 	currentRole := types.RoleAssistant
@@ -218,14 +242,21 @@ func (s *Server) LoadSession(ctx context.Context, p acp.LoadSessionRequest) (acp
 		case types.PartTypeTool:
 			var tp types.ToolPart
 			if _, err := runtime.UnmarshalPartData(part.Data, &tp); err == nil {
+				startOpts := []acp.ToolCallStartOpt{
+					acp.WithStartKind(toolKind(tp.Tool)),
+					acp.WithStartStatus(toolCallStatus(tp.State)),
+					acp.WithStartRawOutput(tp.Output),
+				}
+				if tp.State == types.ToolStateCompleted && tp.FilePath != "" && tp.NewContent != "" {
+					log.Printf("[diff] replaying diff session=%s tool=%s path=%s", sessionID, tp.Tool, tp.FilePath)
+					startOpts = append(startOpts, acp.WithStartContent([]acp.ToolCallContent{
+						acp.ToolContent(acp.ContentBlock{Text: &acp.ContentBlockText{Text: tp.Output}}),
+						acp.ToolDiffContent(tp.FilePath, tp.NewContent, tp.OldContent),
+					}))
+				}
 				_ = s.conn.SessionUpdate(ctx, acp.SessionNotification{
 					SessionId: sid,
-					Update: acp.StartToolCall(
-						acp.ToolCallId(tp.CallID),
-						tp.Tool,
-						acp.WithStartStatus(toolCallStatus(tp.State)),
-						acp.WithStartRawOutput(tp.Output),
-					),
+					Update:    acp.StartToolCall(acp.ToolCallId(tp.CallID), tp.Tool, startOpts...),
 				})
 			}
 		}
@@ -237,11 +268,70 @@ func (s *Server) LoadSession(ctx context.Context, p acp.LoadSessionRequest) (acp
 func promptText(blocks []acp.ContentBlock) string {
 	var sb strings.Builder
 	for _, b := range blocks {
-		if b.Text != nil {
+		switch {
+		case b.Text != nil:
 			sb.WriteString(b.Text.Text)
+
+		case b.ResourceLink != nil:
+			uri := b.ResourceLink.Uri
+			name := b.ResourceLink.Name
+			if content, path, err := readFileFromURI(uri); err == nil {
+				sb.WriteString("\n[file: ")
+				sb.WriteString(path)
+				sb.WriteString("]\n")
+				sb.WriteString(content)
+				sb.WriteString("\n")
+			} else {
+				log.Printf("[acp] resource_link read error name=%s: %v", name, err)
+				sb.WriteString("\n[file: ")
+				sb.WriteString(uri)
+				sb.WriteString("]\n")
+			}
+
+		case b.Resource != nil:
+			res := b.Resource.Resource
+			if res.TextResourceContents != nil {
+				path := uriToPath(res.TextResourceContents.Uri)
+				sb.WriteString("\n[file: ")
+				sb.WriteString(path)
+				sb.WriteString("]\n")
+				sb.WriteString(res.TextResourceContents.Text)
+				sb.WriteString("\n")
+			} else if res.BlobResourceContents != nil {
+				sb.WriteString("\n[file: ")
+				sb.WriteString(res.BlobResourceContents.Uri)
+				sb.WriteString("]\n")
+			}
 		}
 	}
 	return sb.String()
+}
+
+func readFileFromURI(rawURI string) (content, path string, err error) {
+	path = uriToPath(rawURI)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", path, err
+	}
+	return string(data), path, nil
+}
+
+func uriToPath(rawURI string) string {
+	u, err := url.Parse(rawURI)
+	if err != nil {
+		return rawURI
+	}
+	switch u.Scheme {
+	case "file":
+		return filepath.FromSlash(u.Path)
+	case "zed":
+		if p := u.Query().Get("path"); p != "" {
+			return p
+		}
+		return u.Path
+	default:
+		return rawURI
+	}
 }
 
 func toolCallStatus(state types.ToolState) acp.ToolCallStatus {
@@ -257,4 +347,24 @@ func toolCallStatus(state types.ToolState) acp.ToolCallStatus {
 	default:
 		return acp.ToolCallStatusPending
 	}
+}
+
+func toolKind(name string) acp.ToolKind {
+	switch name {
+	case "read_file":
+		return acp.ToolKindRead
+	case "write_file", "edit_file":
+		return acp.ToolKindEdit
+	case "grep", "glob", "list_dir":
+		return acp.ToolKindSearch
+	default:
+		return acp.ToolKindOther
+	}
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

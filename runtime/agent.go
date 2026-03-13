@@ -2,13 +2,14 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/google/uuid"
 	agentpkg "github.com/iamanishx/go-ai/agent"
 	"github.com/iamanishx/go-ai/provider"
 	"github.com/iamanishx/go-ai/provider/bedrock"
@@ -59,8 +60,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 		return fmt.Errorf("build history: %w", err)
 	}
 
-	histJSON, _ := json.Marshal(history)
-	log.Printf("[agent] session=%s history_len=%d history=%s", sessionID, len(history), string(histJSON))
+	log.Printf("[agent] session=%s history_len=%d", sessionID, len(history))
 
 	_, err = al.store.CreateUserMessage(sessionID, prompt)
 	if err != nil {
@@ -72,14 +72,24 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 		return fmt.Errorf("create assistant message: %w", err)
 	}
 
+	// pendingCallIDs maps toolName -> LLM callID, set by OnToolCallStart just before Execute.
+	var pendingMu sync.Mutex
+	pendingCallIDs := make(map[string]string)
+
 	toolFactory := filesystem.NewToolFactory(fsClient)
-	tools := al.instrumentedTools(toolFactory.Tools(), sessionID, assistantMsg.ID, cwd)
+	tools := al.instrumentedTools(toolFactory.Tools(), sessionID, assistantMsg.ID, cwd, &pendingMu, pendingCallIDs)
 
 	ag := agentpkg.CreateToolLoopAgent(agentpkg.ToolLoopAgentSettings{
 		Model:        al.provider,
 		Tools:        tools,
 		ExecuteTools: true,
 		MaxSteps:     20,
+		OnToolCallStart: func(e agentpkg.OnToolCallStartEvent) {
+			pendingMu.Lock()
+			pendingCallIDs[e.ToolName] = e.ToolCallID
+			pendingMu.Unlock()
+			log.Printf("[agent] tool-start session=%s tool=%s call_id=%s", sessionID, e.ToolName, e.ToolCallID)
+		},
 	})
 
 	s, err := ag.Stream(ctx, agentpkg.AgentCallOptions{
@@ -91,15 +101,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 	}
 	defer s.Close()
 
-	type toolEntry struct {
-		partID string
-		tool   types.ToolPart
-	}
-
-	var (
-		textBuf     strings.Builder
-		activeTools = make(map[string]toolEntry)
-	)
+	var textBuf strings.Builder
 
 	for part := range s.Part() {
 		switch part.Type {
@@ -117,35 +119,7 @@ func (al *AgentLoop) Run(ctx context.Context, sessionID, cwd, prompt string) err
 				textBuf.Reset()
 			}
 
-		case "tool-call":
-			toolPart := types.ToolPart{
-				CallID:    part.ToolCallID,
-				Tool:      part.ToolName,
-				State:     types.ToolStateRunning,
-				TimeStart: time.Now().UnixMilli(),
-			}
-			p, err := al.store.AddToolPart(assistantMsg.ID, sessionID, toolPart)
-			if err == nil {
-				activeTools[part.ToolCallID] = toolEntry{partID: p.ID, tool: toolPart}
-			}
-
-		case "tool-result":
-			if entry, ok := activeTools[part.ToolCallID]; ok {
-				entry.tool.State = types.ToolStateCompleted
-				entry.tool.Output = part.ToolResult
-				entry.tool.TimeEnd = time.Now().UnixMilli()
-				_ = al.store.UpdateToolPart(entry.partID, entry.tool)
-				delete(activeTools, part.ToolCallID)
-			}
-
 		case "error":
-			for callID, entry := range activeTools {
-				entry.tool.State = types.ToolStateError
-				entry.tool.Error = fmt.Sprintf("%v", part.Error)
-				entry.tool.TimeEnd = time.Now().UnixMilli()
-				_ = al.store.UpdateToolPart(entry.partID, entry.tool)
-				delete(activeTools, callID)
-			}
 			return fmt.Errorf("agent error: %w", part.Error)
 		}
 	}
@@ -235,24 +209,42 @@ func (al *AgentLoop) buildHistory(sessionID string) ([]provider.Message, error) 
 	return history, nil
 }
 
-func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, messageID, cwd string) []provider.Tool {
+func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, messageID, cwd string, pendingMu *sync.Mutex, pendingCallIDs map[string]string) []provider.Tool {
 	out := make([]provider.Tool, len(tools))
 	for i, t := range tools {
 		t := t
 		originalExecute := t.Execute
 		t.Execute = func(input map[string]any) (string, error) {
-			callID := uuid.New().String()
+			pendingMu.Lock()
+			callID := pendingCallIDs[t.Name]
+			delete(pendingCallIDs, t.Name)
+			pendingMu.Unlock()
+
+			var oldContent, filePath string
+			if isWriteOp(t.Name) {
+				filePath = resolveToolPath(t.Name, input, cwd)
+				if filePath != "" {
+					if data, err := os.ReadFile(filePath); err == nil {
+						oldContent = string(data)
+						log.Printf("[diff] captured old content tool=%s path=%s bytes=%d", t.Name, filePath, len(oldContent))
+					} else {
+						log.Printf("[diff] old file not found (new file) tool=%s path=%s", t.Name, filePath)
+					}
+				}
+			}
+
 			toolPart := types.ToolPart{
 				CallID:    callID,
 				Tool:      t.Name,
 				State:     types.ToolStatePending,
 				Input:     input,
 				TimeStart: time.Now().UnixMilli(),
+				FilePath:  filePath,
 			}
 			p, _ := al.store.AddToolPart(messageID, sessionID, toolPart)
 
 			toolPart.State = types.ToolStateRunning
-			_ = al.store.UpdateToolPart(p.ID, toolPart)
+			_ = al.store.UpdateToolPart(p.ID, sessionID, toolPart)
 
 			result, err := originalExecute(input)
 
@@ -260,20 +252,28 @@ func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, message
 			if err != nil {
 				toolPart.State = types.ToolStateError
 				toolPart.Error = err.Error()
+				log.Printf("[agent] tool error session=%s tool=%s call_id=%s: %v", sessionID, t.Name, callID, err)
 			} else {
 				toolPart.State = types.ToolStateCompleted
 				toolPart.Output = result
-			}
-			_ = al.store.UpdateToolPart(p.ID, toolPart)
-
-			if err == nil && isWriteOp(t.Name) {
-				if path, ok := inputPath(input); ok {
-					al.bus.Publish(Event{
-						Type:      EventFileChanged,
-						SessionID: sessionID,
-						Data:      map[string]string{"path": path, "op": t.Name, "cwd": cwd},
-					})
+				if filePath != "" {
+					toolPart.OldContent = oldContent
+					if data, readErr := os.ReadFile(filePath); readErr == nil {
+						toolPart.NewContent = string(data)
+						log.Printf("[diff] captured new content tool=%s path=%s old_bytes=%d new_bytes=%d", t.Name, filePath, len(oldContent), len(toolPart.NewContent))
+					} else {
+						log.Printf("[diff] failed to read new content tool=%s path=%s: %v", t.Name, filePath, readErr)
+					}
 				}
+			}
+			_ = al.store.UpdateToolPart(p.ID, sessionID, toolPart)
+
+			if err == nil && isWriteOp(t.Name) && filePath != "" {
+				al.bus.Publish(Event{
+					Type:      EventFileChanged,
+					SessionID: sessionID,
+					Data:      map[string]string{"path": filePath, "op": t.Name, "cwd": cwd},
+				})
 			}
 
 			return result, err
@@ -281,4 +281,23 @@ func (al *AgentLoop) instrumentedTools(tools []provider.Tool, sessionID, message
 		out[i] = t
 	}
 	return out
+}
+
+func resolveToolPath(toolName string, input map[string]any, cwd string) string {
+	key := "path"
+	if toolName == "write_file" || toolName == "edit_file" {
+		key = "path"
+	}
+	raw, ok := input[key]
+	if !ok {
+		return ""
+	}
+	p, ok := raw.(string)
+	if !ok || p == "" {
+		return ""
+	}
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(cwd, p)
 }

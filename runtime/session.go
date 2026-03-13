@@ -244,14 +244,14 @@ func (ms *MessageStore) AddToolPart(messageID, sessionID string, tool types.Tool
 	return p, nil
 }
 
-func (ms *MessageStore) UpdateToolPart(partID string, tool types.ToolPart) error {
+func (ms *MessageStore) UpdateToolPart(partID, sessionID string, tool types.ToolPart) error {
 	if err := ms.db.UpdatePart(storage.Part{
 		ID:   partID,
 		Data: marshalPartData(types.PartTypeTool, tool),
 	}); err != nil {
 		return fmt.Errorf("update tool part: %w", err)
 	}
-	ms.bus.Publish(Event{Type: EventPartUpdated, Data: map[string]any{"part_id": partID, "tool": tool}})
+	ms.bus.Publish(Event{Type: EventPartUpdated, SessionID: sessionID, Data: map[string]any{"part_id": partID, "tool": tool}})
 	return nil
 }
 

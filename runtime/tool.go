@@ -49,7 +49,7 @@ func (tr *ToolRunner) Execute(ctx context.Context, sessionID, messageID, cwd, to
 	}
 
 	tool.State = types.ToolStateRunning
-	_ = tr.store.UpdateToolPart(part.ID, tool)
+	_ = tr.store.UpdateToolPart(part.ID, sessionID, tool)
 
 	output, execErr := tr.dispatch(ctx, cwd, toolName, input)
 
@@ -62,7 +62,7 @@ func (tr *ToolRunner) Execute(ctx context.Context, sessionID, messageID, cwd, to
 		tool.Output = output
 	}
 
-	_ = tr.store.UpdateToolPart(part.ID, tool)
+	_ = tr.store.UpdateToolPart(part.ID, sessionID, tool)
 
 	if isWriteOp(toolName) {
 		if path, ok := inputPath(input); ok {
