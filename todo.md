@@ -1,2 +1,2 @@
-> mention file as @ should work from the acp cleint //done
-> diff viewer like we should send the //done
+> context compacation along with sliding window method 
+> lsp integration
