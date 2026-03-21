@@ -17,11 +17,17 @@ import (
 	"goai-test/storage"
 )
 
+var (
+	defaultProfile = "default"
+	defaultRegion  = "us-east-1"
+	defaultModel   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+)
+
 func main() {
 	dbPath := flag.String("db-path", defaultDBPath(), "path to SQLite database")
-	region := flag.String("region", "us-east-1", "AWS region for Bedrock")
-	profile := flag.String("profile", "clickpe", "AWS profile for Bedrock")
-	modelID := flag.String("model", "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "Bedrock model ID")
+	region := flag.String("region", defaultRegion, "AWS region for Bedrock")
+	profile := flag.String("profile", defaultProfile, "AWS profile for Bedrock")
+	modelID := flag.String("model", defaultModel, "Bedrock model ID")
 	flag.Parse()
 
 	logDir := filepath.Join(filepath.Dir(defaultDBPath()), "logs")
