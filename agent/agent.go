@@ -13,8 +13,10 @@ import (
 	agentpkg "github.com/iamanishx/go-ai/agent"
 	"github.com/iamanishx/go-ai/provider"
 	"github.com/iamanishx/go-ai/provider/bedrock"
+	"goai-test/lsp"
 	"goai-test/runtime"
 	"goai-test/tools/filesystem"
+	"goai-test/tools/shell"
 	"goai-test/types"
 )
 
@@ -77,7 +79,8 @@ func (l *Loop) Run(ctx context.Context, sessionID, cwd, prompt string) error {
 	pendingCallIDs := make(map[string]string)
 
 	toolFactory := filesystem.NewToolFactory(fsClient)
-	tools := l.instrumentedTools(toolFactory.Tools(), sessionID, assistantMsg.ID, cwd, &pendingMu, pendingCallIDs)
+	allTools := append(toolFactory.Tools(), shell.Tool(cwd))
+	tools := l.instrumentedTools(allTools, sessionID, assistantMsg.ID, cwd, &pendingMu, pendingCallIDs)
 
 	ag := agentpkg.CreateToolLoopAgent(agentpkg.ToolLoopAgentSettings{
 		Model:        l.provider,
@@ -264,6 +267,15 @@ func (l *Loop) instrumentedTools(tools []provider.Tool, sessionID, messageID, cw
 						log.Printf("[diff] captured new content tool=%s path=%s old_bytes=%d new_bytes=%d", t.Name, filePath, len(oldContent), len(toolPart.NewContent))
 					} else {
 						log.Printf("[diff] failed to read new content tool=%s path=%s: %v", t.Name, filePath, readErr)
+					}
+				}
+				if isWriteOp(t.Name) && filePath != "" {
+					diags, diagErr := lsp.Check(filePath, cwd)
+					if diagErr != nil {
+						log.Printf("[lsp] check error tool=%s path=%s: %v", t.Name, filePath, diagErr)
+					} else if len(diags) > 0 {
+						log.Printf("[lsp] diagnostics tool=%s path=%s count=%d has_errors=%v", t.Name, filePath, len(diags), lsp.HasErrors(diags))
+						toolPart.Output = result + "\n\nDiagnostics:\n" + lsp.Format(diags)
 					}
 				}
 			}

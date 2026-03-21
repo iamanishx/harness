@@ -136,6 +136,7 @@ func (s *Server) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptRes
 							tp.Tool,
 							acp.WithStartKind(toolKind(tp.Tool)),
 							acp.WithStartStatus(acp.ToolCallStatusPending),
+							acp.WithStartRawInput(tp.Input),
 						),
 					})
 				}
@@ -246,6 +247,7 @@ func (s *Server) LoadSession(ctx context.Context, p acp.LoadSessionRequest) (acp
 				startOpts := []acp.ToolCallStartOpt{
 					acp.WithStartKind(toolKind(tp.Tool)),
 					acp.WithStartStatus(toolCallStatus(tp.State)),
+					acp.WithStartRawInput(tp.Input),
 					acp.WithStartRawOutput(tp.Output),
 				}
 				if tp.State == types.ToolStateCompleted && tp.FilePath != "" && tp.NewContent != "" {
@@ -358,6 +360,8 @@ func toolKind(name string) acp.ToolKind {
 		return acp.ToolKindEdit
 	case "grep", "glob", "list_dir":
 		return acp.ToolKindSearch
+	case "run_command":
+		return acp.ToolKindExecute
 	default:
 		return acp.ToolKindOther
 	}
