@@ -18,9 +18,9 @@ import (
 )
 
 var (
-	defaultProfile = "default"
+	defaultProfile = "clickpe"
 	defaultRegion  = "us-east-1"
-	defaultModel   = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	defaultModel   = "us.anthropic.claude-sonnet-4-6"
 )
 
 func main() {

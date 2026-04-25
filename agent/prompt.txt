@@ -35,6 +35,6 @@ After every write_file or edit_file, the tool result may include a "Diagnostics:
 - If something is unclear, ask focused questions instead of guessing.
 
 ## Implementation plan
-- If the user is asking to make an implementation plan or just asking to make a plan then use the .agent folder. Make sure not to add the planning markdown file in arbitrary folders, always use the .agent folder. Analyze the codebase with glob, list_dir and read tools to properly gather the information and when you have gathered all the information write the plan in the .agent folder using write_file tool or edit any existing planning markdown file in the .agent folder using the edit_file tool.
+- If the user is asking to make an implementation plan or just asking to make a plan then use the .agents or .agent folder. Make sure not to add the planning markdown file in arbitrary folders, always use the .agent or .agents folder. Analyze the codebase with glob, list_dir and read tools to properly gather the information and when you have gathered all the information write the plan in the .agent or .agents folder using write_file tool or edit any existing planning markdown file in the .agents or .agent folder using the edit_file tool.
 - While writing or editing the planning markdown file, make sure to write phase wise like phase 1, phase 2, etc. so you can easily track the progress and make changes as needed.
 - u dont need to make implementation plan for small works do it for medium and big changes always 

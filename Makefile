@@ -6,9 +6,9 @@ ZIG_BIN    := $(ZIG_DIR)/zig-out/bin/filesystem_mcp
 ZED_CONFIG := $(HOME)/.config/zed/settings.json
 INSTALL_DIR := $(HOME)/.local/bin
 
-AWS_PROFILE ?= default
+AWS_PROFILE ?= clickpe
 AWS_REGION  ?= us-east-1
-MODEL       ?= us.anthropic.claude-sonnet-4-6-20250219-v1:0
+MODEL       ?= us.anthropic.claude-sonnet-4-6
 
 .PHONY: all build zig go install zed clean help
 
